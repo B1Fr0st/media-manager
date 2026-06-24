@@ -1,0 +1,17 @@
+services:
+  media-manager:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      # Downloaded files land here — change the left side to any path you like
+      - ./downloads:/downloads
+      # Optional: mount your gallery-dl config for Instagram auth (cookies etc.)
+      # Create ~/.config/gallery-dl/config.json on the host first, then uncomment:
+      - .config/gallery-dl/config.json:/root/.config/gallery-dl/config.json:ro
+      - ./cookies.txt:/root/.config/gallery-dl/cookies.txt
+    environment:
+      DOWNLOAD_DIR: /downloads
+    restart: unless-stopped
+    # Give downloads enough memory headroom
+    mem_limit: 2g

@@ -1,0 +1,9 @@
+{
+  "extractor": {
+    "cookies": "/root/.config/gallery-dl/cookies.txt",
+
+    "instagram": {
+      "include": ["posts", "reels"]
+    }
+  }
+}
