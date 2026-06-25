@@ -611,22 +611,32 @@ function renderBrGrid() {
   });
 }
 
+function thumbUrl(item) {
+  // Derive thumbnail URL from the file URL: /files/:id/:path → /thumbs/:id/:path
+  return item.url.replace(/^\/files\//, '/thumbs/');
+}
+
 function makeThumbnail(item, onclick) {
   const thumb = document.createElement('div');
   thumb.className = 'thumb';
   thumb.onclick = onclick;
+
+  // Always show a lightweight JPEG thumbnail — generated once by ffmpeg on the server.
+  // Neither images nor videos load their actual file until opened in the scroll viewer.
+  const img = document.createElement('img');
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  img.src = thumbUrl(item);
+  img.alt = item.name || '';
+  thumb.appendChild(img);
+
   if (item.kind === 'video') {
-    const vid = document.createElement('video');
-    vid.src = item.url; vid.preload = 'metadata'; vid.muted = true; vid.playsInline = true;
-    thumb.appendChild(vid);
     const badge = document.createElement('div');
-    badge.className = 'play-badge'; badge.textContent = '▶';
+    badge.className = 'play-badge';
+    badge.textContent = '▶';
     thumb.appendChild(badge);
-  } else {
-    const img = document.createElement('img');
-    img.loading = 'lazy'; img.decoding = 'async'; img.src = item.url; img.alt = item.name || '';
-    thumb.appendChild(img);
   }
+
   return thumb;
 }
 

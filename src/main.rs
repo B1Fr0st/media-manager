@@ -151,6 +151,7 @@ async fn main() {
         .route("/api/favorites", get(list_favs).post(add_fav))
         .route("/api/favorites/:id", delete(remove_fav))
         .route("/files/:id/*file_path", get(serve_file))
+        .route("/thumbs/:id/*file_path", get(thumb_handler))
         .route("/ws", get(ws_handler))
         .with_state(state);
 
@@ -308,6 +309,82 @@ async fn serve_file(
         .header(header::ACCEPT_RANGES, "bytes")
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Returns a thumbnail JPEG for any media file. Generated once via ffmpeg and
+/// cached permanently in `{job_dir}/.thumbs/{rel_path}.jpg`.
+async fn thumb_handler(
+    Path((id, file_path)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    let base = state.download_dir.join(&id);
+    let src  = base.join(&file_path);
+
+    if !src.starts_with(&base) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // Cache: {base}/.thumbs/{file_path}.jpg
+    let thumb = base.join(".thumbs").join(&file_path).with_extension("jpg");
+
+    // Serve from disk if already generated
+    if let Ok(bytes) = tokio::fs::read(&thumb).await {
+        return (
+            [
+                (header::CONTENT_TYPE,  "image/jpeg"),
+                (header::CACHE_CONTROL, "max-age=31536000, immutable"),
+            ],
+            bytes,
+        )
+            .into_response();
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = thumb.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let is_video = matches!(
+        ext.as_str(),
+        "mp4" | "webm" | "mov" | "mkv" | "avi" | "m4v" | "3gp"
+    );
+
+    // Build ffmpeg command. For videos, seek to 1 s before opening the file
+    // so ffmpeg doesn't have to decode from the start.
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y");
+    if is_video {
+        cmd.args(["-ss", "1"]);
+    }
+    cmd.args([
+        "-i",
+        src.to_str().unwrap(),
+        "-vframes",
+        "1",
+        "-vf",
+        "scale=400:400:force_original_aspect_ratio=decrease",
+        "-q:v",
+        "4",
+        thumb.to_str().unwrap(),
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+
+    match cmd.status().await {
+        Ok(s) if s.success() => match tokio::fs::read(&thumb).await {
+            Ok(bytes) => (
+                [
+                    (header::CONTENT_TYPE,  "image/jpeg"),
+                    (header::CACHE_CONTROL, "max-age=31536000, immutable"),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 // ── Favorites handlers ────────────────────────────────────────────────────────
