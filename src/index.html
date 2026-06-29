@@ -526,6 +526,7 @@ async function toggleFav(item, btn) {
 
 function renderFavsGrid() {
   const grid = document.getElementById('favs-grid');
+  grid.querySelectorAll('img').forEach(img => thumbObserver.unobserve(img));
   grid.innerHTML = '';
   if (!favs.length) {
     grid.innerHTML = `<div class="favs-empty" style="grid-column:1/-1">
@@ -601,6 +602,7 @@ function applyFilter() {
 
 function renderBrGrid() {
   const grid = document.getElementById('br-grid');
+  grid.querySelectorAll('img').forEach(img => thumbObserver.unobserve(img));
   grid.innerHTML = '';
   if (!viewItems.length) {
     grid.innerHTML = '<div class="br-empty">No photos or videos found.<br>Files may still be downloading.</div>';
@@ -616,6 +618,21 @@ function thumbUrl(item) {
   return item.url.replace(/^\/files\//, '/thumbs/');
 }
 
+// Shared observer for all thumbnail grids. Attaches the JPEG src only when a
+// thumb nears the viewport and drops it again once it's scrolled well away, so
+// the number of decoded images stays bounded no matter how many items exist.
+const thumbObserver = new IntersectionObserver(entries => {
+  for (const entry of entries) {
+    const img = entry.target;
+    if (entry.isIntersecting) {
+      if (img.dataset.src && !img.src) img.src = img.dataset.src;
+    } else if (img.src) {
+      // Released only when far outside view (rootMargin below keeps neighbours).
+      img.removeAttribute('src');
+    }
+  }
+}, { rootMargin: '600px 0px' });
+
 function makeThumbnail(item, onclick) {
   const thumb = document.createElement('div');
   thumb.className = 'thumb';
@@ -624,11 +641,11 @@ function makeThumbnail(item, onclick) {
   // Always show a lightweight JPEG thumbnail — generated once by ffmpeg on the server.
   // Neither images nor videos load their actual file until opened in the scroll viewer.
   const img = document.createElement('img');
-  img.loading = 'lazy';
   img.decoding = 'async';
-  img.src = thumbUrl(item);
+  img.dataset.src = thumbUrl(item);
   img.alt = item.name || '';
   thumb.appendChild(img);
+  thumbObserver.observe(img);
 
   if (item.kind === 'video') {
     const badge = document.createElement('div');
@@ -641,12 +658,18 @@ function makeThumbnail(item, onclick) {
 }
 
 // ── Vertical scroll viewer ────────────────────────────────────────────────────
+// Only items within WINDOW positions of the active one keep real media loaded.
+// Everything else is an empty placeholder that still occupies a full screen so
+// scroll position and snap behave — this keeps memory flat regardless of count.
+const SV_WINDOW = 1;
+let svCurrent = 0; // index of the item currently centred in the viewport
+
 function openScrollView(items, startIdx) {
   svItems = items;
 
   // tear down any previous session
   if (svObserver) { svObserver.disconnect(); svObserver = null; }
-  document.querySelectorAll('#sv-items video').forEach(v => { v.pause(); v.src = ''; });
+  unloadAllSvMedia();
 
   const container = document.getElementById('sv-items');
   container.innerHTML = '';
@@ -656,20 +679,7 @@ function openScrollView(items, startIdx) {
     div.className = 'sv-item';
     div.dataset.idx = i;
 
-    if (item.kind === 'video') {
-      const vid = document.createElement('video');
-      // lazy: set data-src, observer will promote to src when near viewport
-      vid.dataset.src = item.url;
-      vid.loop = true; vid.playsInline = true; vid.controls = true;
-      div.appendChild(vid);
-    } else {
-      const img = document.createElement('img');
-      img.loading = 'lazy'; img.decoding = 'async';
-      img.src = item.url; img.alt = item.name || '';
-      div.appendChild(img);
-    }
-
-    // Heart button
+    // Heart button (always present; cheap)
     const actions = document.createElement('div');
     actions.className = 'sv-actions';
     const favBtn = document.createElement('button');
@@ -688,42 +698,96 @@ function openScrollView(items, startIdx) {
   sv.style.display = 'block';
   document.body.style.overflow = 'hidden';
 
-  // Jump to start item (instant, before observer fires)
   const itemEls = container.querySelectorAll('.sv-item');
+  const total = items.length;
+
+  // Load the window around the start item, then jump there.
+  svCurrent = startIdx;
+  syncSvWindow();
   if (startIdx > 0 && itemEls[startIdx]) {
     itemEls[startIdx].scrollIntoView({ behavior: 'instant' });
   }
-
-  // Update counter for start item immediately
-  const total = items.length;
   document.getElementById('sv-counter').textContent = `${startIdx + 1} / ${total}`;
 
-  // IntersectionObserver: autoplay video + update counter + lazy-load
+  // IntersectionObserver: track the centred item, then (re)load its window.
   svObserver = new IntersectionObserver(entries => {
-    entries.forEach(entry => {
-      const el = entry.target;
-      const idx = parseInt(el.dataset.idx);
-      const vid = el.querySelector('video');
-      if (entry.isIntersecting) {
-        document.getElementById('sv-counter').textContent = `${idx + 1} / ${total}`;
-        // Lazy-load video src
-        if (vid && vid.dataset.src) {
-          vid.src = vid.dataset.src;
-          vid.removeAttribute('data-src');
-        }
-        if (vid) vid.play().catch(() => {});
-      } else {
-        if (vid && vid.src) vid.pause();
-      }
-    });
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const idx = parseInt(entry.target.dataset.idx);
+      if (idx === svCurrent) continue;
+      svCurrent = idx;
+      document.getElementById('sv-counter').textContent = `${idx + 1} / ${total}`;
+      syncSvWindow();
+    }
   }, { threshold: 0.5 });
 
   itemEls.forEach(el => svObserver.observe(el));
 }
 
+// Ensure exactly the items in [svCurrent-WINDOW, svCurrent+WINDOW] have media
+// attached, and everything else is torn down to free memory.
+function syncSvWindow() {
+  const container = document.getElementById('sv-items');
+  const els = container.querySelectorAll('.sv-item');
+  els.forEach(el => {
+    const idx = parseInt(el.dataset.idx);
+    const inWindow = Math.abs(idx - svCurrent) <= SV_WINDOW;
+    if (inWindow) {
+      loadSvItem(el, idx);
+    } else {
+      unloadSvItem(el);
+    }
+  });
+}
+
+function loadSvItem(el, idx) {
+  const item = svItems[idx];
+  if (!item) return;
+  let media = el.querySelector('img, video');
+
+  if (item.kind === 'video') {
+    if (!media) {
+      media = document.createElement('video');
+      media.loop = true; media.playsInline = true; media.controls = true;
+      media.preload = 'metadata';
+      el.insertBefore(media, el.firstChild);
+    }
+    if (!media.src) media.src = item.url;
+    // Only the centred video plays; neighbours stay paused/buffered light.
+    if (idx === svCurrent) media.play().catch(() => {}); else media.pause();
+  } else {
+    if (!media) {
+      media = document.createElement('img');
+      media.loading = 'lazy'; media.decoding = 'async';
+      media.alt = item.name || '';
+      el.insertBefore(media, el.firstChild);
+    }
+    if (!media.src) media.src = item.url;
+  }
+}
+
+function unloadSvItem(el) {
+  const media = el.querySelector('img, video');
+  if (!media) return;
+  if (media.tagName === 'VIDEO') {
+    media.pause();
+    media.removeAttribute('src');
+    media.load(); // forces the buffer to be released
+  }
+  media.remove();
+}
+
+function unloadAllSvMedia() {
+  document.querySelectorAll('#sv-items video').forEach(v => {
+    v.pause(); v.removeAttribute('src'); v.load();
+  });
+  document.querySelectorAll('#sv-items img, #sv-items video').forEach(m => m.remove());
+}
+
 function closeScrollView() {
   if (svObserver) { svObserver.disconnect(); svObserver = null; }
-  document.querySelectorAll('#sv-items video').forEach(v => { v.pause(); v.src = ''; });
+  unloadAllSvMedia();
+  document.getElementById('sv-items').innerHTML = '';
   document.getElementById('scroll-view').style.display = 'none';
   document.body.style.overflow = '';
 }

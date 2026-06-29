@@ -22,7 +22,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader},
     process::Command,
-    sync::{broadcast, oneshot, Mutex},
+    sync::{broadcast, oneshot, Mutex, Semaphore},
 };
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -110,6 +110,9 @@ struct AppState {
     favorites: Arc<Mutex<Vec<Favorite>>>,
     tx: broadcast::Sender<String>,
     download_dir: PathBuf,
+    /// Caps concurrent ffmpeg thumbnail jobs so a fresh grid of hundreds of
+    /// items doesn't fork hundreds of ffmpeg processes and saturate the CPU.
+    thumb_sem: Arc<Semaphore>,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +142,7 @@ async fn main() {
         favorites: Arc::new(Mutex::new(favorites)),
         tx,
         download_dir,
+        thumb_sem: Arc::new(Semaphore::new(thumb_concurrency())),
     };
 
     let app = Router::new()
@@ -349,6 +353,22 @@ async fn thumb_handler(
         ext.as_str(),
         "mp4" | "webm" | "mov" | "mkv" | "avi" | "m4v" | "3gp"
     );
+
+    // Limit how many ffmpeg jobs run at once. Held for the duration of the
+    // spawn so a burst of grid requests queues instead of forking everything.
+    let _permit = state.thumb_sem.acquire().await;
+
+    // Another request may have generated the thumb while we waited for a permit.
+    if let Ok(bytes) = tokio::fs::read(&thumb).await {
+        return (
+            [
+                (header::CONTENT_TYPE,  "image/jpeg"),
+                (header::CACHE_CONTROL, "max-age=31536000, immutable"),
+            ],
+            bytes,
+        )
+            .into_response();
+    }
 
     // Build ffmpeg command. For videos, seek to 1 s before opening the file
     // so ffmpeg doesn't have to decode from the start.
@@ -842,6 +862,21 @@ async fn save_favorites(download_dir: &PathBuf, favs: &[Favorite]) {
 }
 
 // ── Misc helpers ──────────────────────────────────────────────────────────────
+
+/// Max simultaneous ffmpeg thumbnail jobs. Defaults to the CPU count (min 2),
+/// overridable via THUMB_CONCURRENCY.
+fn thumb_concurrency() -> usize {
+    std::env::var("THUMB_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+                .max(2)
+        })
+}
 
 fn detect_source(url: &str) -> &'static str {
     if url.contains("mega.nz") || url.contains("mega.co.nz") {
